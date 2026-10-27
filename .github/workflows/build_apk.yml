@@ -1,0 +1,131 @@
+name: Build Flutter APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: 2. Décompression intelligente du ZIP
+        run: |
+          if ls *.zip 1> /dev/null 2>&1; then
+            echo "Fichier ZIP détecté, extraction en cours..."
+            mkdir -p temp_extract
+            unzip -q *.zip -d temp_extract
+
+            PUBSPEC_PATH=$(find temp_extract -name "pubspec.yaml" | head -n 1)
+            if [ -n "$PUBSPEC_PATH" ]; then
+              PROJECT_DIR=$(dirname "$PUBSPEC_PATH")
+              echo "Projet détecté dans : $PROJECT_DIR"
+              cp -r "$PROJECT_DIR"/* ./
+            else
+              echo "Erreur : pubspec.yaml introuvable dans l'archive ZIP."
+              exit 1
+            fi
+            rm -rf temp_extract
+          else
+            echo "Pas de ZIP détecté, utilisation des fichiers standards."
+          fi
+
+      - name: 3. Configuration de Java 21 (requis par maplibre_gl)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      - name: 4. Configuration de Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # 3.29.3 embarque Dart 3.7 (requis par maplibre_gl 0.26)
+          flutter-version: '3.29.3'
+          channel: 'stable'
+          cache: true
+
+      - name: 5. Génération automatique de l'ossature Android
+        run: |
+          rm -rf android
+          flutter create . --platforms=android --project-name trouve_ton_parcours
+          sed -i 's/android:label=".*"/android:label="TotoPa"/' android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>\n    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+          grep -n "uses-permission" android/app/src/main/AndroidManifest.xml
+          # Kotlin >= 2.1.0 (fichiers Groovy ou Kotlin DSL selon la version de Flutter)
+          for f in android/settings.gradle android/settings.gradle.kts; do
+            if [ -f "$f" ]; then
+              sed -i -E 's/(org\.jetbrains\.kotlin\.android"\)? version ")[0-9.]+(")/\12.1.0\2/' "$f"
+            fi
+          done
+          grep -n "kotlin" android/settings.gradle android/settings.gradle.kts android/build.gradle 2>/dev/null || true
+
+      - name: 5b. Bloquer androidx.core à 1.16.0 (la 1.17 exige AGP 8.9.1 et compileSdk 36)
+        run: |
+          if [ -f android/build.gradle ]; then
+            cat >> android/build.gradle <<'EOF'
+
+          allprojects {
+              configurations.all {
+                  resolutionStrategy {
+                      force 'androidx.core:core:1.16.0'
+                      force 'androidx.core:core-ktx:1.16.0'
+                  }
+              }
+          }
+          EOF
+          elif [ -f android/build.gradle.kts ]; then
+            cat >> android/build.gradle.kts <<'EOF'
+
+          allprojects {
+              configurations.all {
+                  resolutionStrategy {
+                      force("androidx.core:core:1.16.0")
+                      force("androidx.core:core-ktx:1.16.0")
+                  }
+              }
+          }
+          EOF
+          fi
+          tail -n 12 android/build.gradle* || true
+
+      - name: 5c. minSdk 23 (exigé par play-services-base, utilisé par geolocator)
+        run: |
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            if [ -f "$f" ]; then
+              sed -i 's/flutter\.minSdkVersion/23/' "$f"
+              grep -n "minSdk" "$f" || true
+            fi
+          done
+
+      - name: 5d. compileSdk 36 (exigé par maplibre_gl)
+        run: |
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            if [ -f "$f" ]; then
+              sed -i 's/flutter\.compileSdkVersion/36/' "$f"
+              grep -n "compileSdk" "$f" || true
+            fi
+          done
+          echo "android.suppressUnsupportedCompileSdk=36" >> android/gradle.properties
+          tail -n 5 android/gradle.properties
+
+      - name: 6. Installation des dépendances
+        run: flutter pub get
+
+      - name: 6b. Icône de l'application (assets/icon -> téléphone)
+        run: dart run flutter_launcher_icons
+
+      - name: 7. Analyse du code (affiche les erreurs Dart clairement)
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
+
+      - name: 8. Construction de l'APK (Release)
+        run: flutter build apk --release
+
+      - name: 9. Sauvegarde de l'APK (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: trouve-ton-parcours-release
+          path: build/app/outputs/flutter-apk/app-release.apk
